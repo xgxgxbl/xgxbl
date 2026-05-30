@@ -1,0 +1,65 @@
+# GNSS控制网观测数据质量检查程序：网页部署版
+
+## 课程设计题目
+
+GNSS控制网观测数据质量检查程序
+
+## 主程序入口
+
+```bash
+app.py
+```
+
+## 功能模块
+
+1. RINEX OBS 文件读取
+2. 文件摘要：测站名、历元数、观测类型、卫星数量
+3. SNR 信噪比分析：平均值、最大值、最小值、时间序列图
+4. MW + GF 周跳探测
+5. MP1 / MP2 多路径分析
+6. 卫星可见性统计
+7. BLH / XYZ / 高斯投影坐标转换
+8. 综合数据质量评价：评分、等级和适用性建议
+
+## 本地运行
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+## 发布为网页链接
+
+推荐使用 Streamlit Community Cloud。
+
+1. 将本文件夹中的文件上传到一个 GitHub 仓库。
+2. 打开 Streamlit Community Cloud。
+3. 点击 Create app。
+4. 选择你的 GitHub 仓库。
+5. Main file path 填写：
+
+```text
+app.py
+```
+
+6. 点击 Deploy。
+7. 部署完成后会得到类似下面的网页链接：
+
+```text
+https://你的应用名.streamlit.app/
+```
+
+## 必须上传的文件
+
+```text
+app.py
+rinex_reader.py
+ gnss_quality.py
+coord_convert.py
+requirements.txt
+.streamlit/config.toml
+```
+
+## 说明
+
+当前版本不依赖桌面 GUI，主界面为网页端。Tkinter 版本不再作为主提交形式。
