@@ -344,7 +344,7 @@ def compute_sat_elevation(sat_xyz, rec_xyz):
 
 
 def compute_quality_metrics(data: Dict[str, Dict[str, Any]], obs_types: List[str]) -> Dict[str, Any]:
-    """计算课程设计用的综合质量评价指标。"""
+    """计算综合质量评价指标。"""
     stats = visibility_stats(data)
     all_sats = sorted(data.keys())
     epochs = sorted(stats.keys()) if stats else []
@@ -393,7 +393,7 @@ def compute_quality_metrics(data: Dict[str, Dict[str, Any]], obs_types: List[str
     mp1_rms = _rms(mp1_values)
     mp2_rms = _rms(mp2_values)
 
-    # 简洁评分规则，适合课程作业说明
+    # 简洁评分规则
     score = 100
     deductions = []
 
@@ -447,7 +447,7 @@ def compute_quality_metrics(data: Dict[str, Dict[str, Any]], obs_types: List[str
     if score >= 90:
         grade = 'A'
         quality = '优秀'
-        suggestion = '适合静态控制测量；观测数据整体稳定，可作为课程设计优质样例。'
+        suggestion = '适合静态控制测量；观测数据整体稳定，可作为高质量观测样例。'
     elif score >= 80:
         grade = 'B'
         quality = '良好'
@@ -455,7 +455,7 @@ def compute_quality_metrics(data: Dict[str, Dict[str, Any]], obs_types: List[str
     elif score >= 70:
         grade = 'C'
         quality = '一般'
-        suggestion = '可用于普通数据分析练习；正式控制测量前建议延长观测或剔除低质量卫星。'
+        suggestion = '可用于一般数据分析；正式控制测量前建议延长观测或剔除低质量卫星。'
     else:
         grade = 'D'
         quality = '较差'
