@@ -16,6 +16,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from rinex_reader import RinexObs
+from rinex_nav_reader import RinexNav
 from gnss_quality import (
     snr_analysis,
     cycle_slip_detect,
@@ -36,6 +37,12 @@ from coord_convert import (
     WGS84,
     CGCS2000,
 )
+from satellite_orbit import (
+    calc_sat_position,
+    calc_sat_azel,
+    compute_dop_from_azel,
+)
+from spp_positioning import spp_solve
 
 st.set_page_config(
     page_title="GNSS控制网观测数据质量检查程序",
@@ -355,6 +362,91 @@ def slip_dataframe(data, obs_types, sat: str, mw_th: float, gf_th: float):
 
 
 # -----------------------------------------------------------------------------
+# NAV / 定位辅助函数
+# -----------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def parse_nav_cached(file_bytes: bytes, filename: str):
+    suffix = os.path.splitext(filename)[1] or ".nav"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(file_bytes)
+        path = tmp.name
+    return RinexNav(path)
+
+
+def get_loaded_nav():
+    uploaded = st.session_state.get("uploaded_nav")
+    if uploaded is None:
+        return None
+    return parse_nav_cached(uploaded.getvalue(), uploaded.name)
+
+
+def get_nav_eph_dict(nav):
+    if nav is None:
+        return {}
+    eph_dict = {}
+    for prn in nav.get_all_prns():
+        ephs = nav._eph.get(prn, [])
+        if ephs:
+            eph_dict[prn] = ephs
+    return eph_dict
+
+
+def pos_dataframe(pos_result):
+    if pos_result is None or not pos_result.get("epochs"):
+        return pd.DataFrame()
+    rows = []
+    for i in range(len(pos_result["epochs"])):
+        rows.append({
+            "时间": pos_result["epochs"][i],
+            "X/m": fmt(pos_result["X"][i], 3),
+            "Y/m": fmt(pos_result["Y"][i], 3),
+            "Z/m": fmt(pos_result["Z"][i], 3),
+            "B/°": fmt(pos_result["lat"][i], 8),
+            "L/°": fmt(pos_result["lon"][i], 8),
+            "H/m": fmt(pos_result["h"][i], 3),
+            "GDOP": fmt(pos_result["GDOP"][i], 1),
+            "PDOP": fmt(pos_result["PDOP"][i], 1),
+            "卫星数": int(pos_result["nsat"][i]) if i < len(pos_result["nsat"]) else 0,
+            "残差RMS/m": fmt(pos_result["rms_residual"][i], 3),
+        })
+    return pd.DataFrame(rows)
+
+
+def make_skyplot(sat_azel_list, title_str="卫星天空图"):
+    """根据 [(el_deg, az_deg, prn), ...] 生成极坐标天空图。"""
+    fig = go.Figure()
+    if not sat_azel_list:
+        return fig
+    for el, az, prn in sat_azel_list:
+        fig.add_trace(go.Scatterpolar(
+            r=[90 - el],
+            theta=[az],
+            mode="markers+text",
+            text=[prn],
+            textposition="top center",
+            marker=dict(size=10, symbol="circle"),
+            name=prn,
+            showlegend=False,
+        ))
+    fig.update_layout(
+        polar=dict(
+            angular=dict(rotation=90, direction="clockwise",
+                         tickmode="array",
+                         tickvals=[0, 90, 180, 270],
+                         ticktext=["N", "E", "S", "W"]),
+            radial=dict(range=[0, 90],
+                        tickvals=[0, 15, 30, 45, 60, 75, 90],
+                        ticktext=["0°", "15°", "30°", "45°", "60°", "75°", "90°"]),
+        ),
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        title=title_str,
+        font=dict(color="#e5e7eb"),
+    )
+    return fig
+
+
+# -----------------------------------------------------------------------------
 # 页面头部
 # -----------------------------------------------------------------------------
 st.markdown(
@@ -388,10 +480,21 @@ with st.sidebar:
     )
 
     st.markdown("---")
+    st.markdown("### 导航电文 (定位)")
+    st.caption("上传 RINEX NAV 导航文件后可进行单点定位解算。")
+    uploaded_nav = st.file_uploader(
+        "选择 RINEX NAV 文件",
+        type=["nav", "NAV", "23n", "24n", "25n", "26n", "N"],
+        key="uploaded_nav",
+    )
+
+    st.markdown("---")
     st.markdown("### 分析参数")
     mw_threshold = st.number_input("MW周跳阈值 / 周", value=3.0, min_value=0.1, max_value=20.0, step=0.1)
     gf_threshold = st.number_input("GF周跳阈值 / m", value=0.15, min_value=0.01, max_value=5.0, step=0.01)
     max_sats_plot = st.slider("多卫星图最多显示卫星数", 4, 20, 10)
+    elev_mask = st.slider("定位截止高度角 / °", 0, 30, 10)
+    pos_system = st.selectbox("定位卫星系统", ["自动 (GPS优先)", "GPS", "BDS"], index=0)
 
     st.markdown("---")
     st.markdown("### 项目信息")
@@ -407,6 +510,16 @@ if uploaded is not None:
         st.error(f"RINEX 解析失败：{exc}")
         rinex = None
 
+# NAV 加载
+nav = None
+if uploaded_nav is not None:
+    try:
+        with st.spinner("正在解析 NAV 导航文件……"):
+            nav = get_loaded_nav()
+    except Exception as exc:
+        st.error(f"NAV 解析失败：{exc}")
+        nav = None
+
 if rinex is None:
     c1, c2, c3 = st.columns([1.1, 1, 1])
     with c1:
@@ -415,17 +528,19 @@ if rinex is None:
             """
             这是网页发布版主界面。上传 RINEX OBS 文件后会自动生成：
 
-            - 文件摘要与综合质量评分  
-            - SNR 时间序列与统计表  
-            - MW+GF 周跳探测曲线  
-            - MP1/MP2 多路径曲线  
-            - 卫星可见性变化图  
+            - 文件摘要与综合质量评分
+            - SNR 时间序列与统计表
+            - MW+GF 周跳探测曲线
+            - MP1/MP2 多路径曲线
+            - 卫星可见性变化图
+            - **单点定位解算（需同时上传 NAV 文件）**
+            - **卫星轨道 / 天空图（需同时上传 NAV 文件）**
             - BLH / XYZ / 高斯投影坐标转换
             """
         )
         panel_end()
     with c2:
-        metric_card("课程设计题目", "GNSS质量检查", "控制网观测数据质量评价")
+        metric_card("课程设计题目", "卫星导航定位", "控制网观测与定位解算")
     with c3:
         metric_card("推荐提交形式", "网页程序", "Streamlit + Python 算法模块")
     st.stop()
@@ -436,10 +551,35 @@ if rinex is None:
 data = rinex.get_data()
 obs_types = rinex.obs_types
 sats = safe_sat_list(rinex)
-metrics = compute_quality_metrics(data, obs_types)
+metrics = compute_quality_metrics(data, obs_types, pos_result)
+
+# SPP 定位解算
+pos_result = None
+if nav is not None and data:
+    try:
+        with st.spinner("正在进行单点定位解算……"):
+            use_iono = False
+            iono_params = nav.iono_params if nav.iono_params else None
+            if iono_params and iono_params.get("alpha"):
+                use_iono = True
+            sys_map = {"自动 (GPS优先)": "G", "GPS": "G", "BDS": "C"}
+            ps = sys_map.get(pos_system, "G")
+            approx_xyz = None
+            if rinex.header.get("approx_xyz"):
+                approx_xyz = tuple(rinex.header["approx_xyz"])
+            pos_result = spp_solve(data, obs_types, get_nav_eph_dict(nav),
+                                  approx_xyz, float(elev_mask), use_iono,
+                                  iono_params, system=ps)
+    except Exception as exc:
+        st.warning(f"定位解算失败：{exc}")
+        pos_result = None
 
 # KPI 卡片
-cols = st.columns(6)
+n_kpi = 7 if pos_result is not None and pos_result.get("n_epochs", 0) > 0 else 6
+if n_kpi >= 7:
+    cols = st.columns(7)
+else:
+    cols = st.columns(6)
 with cols[0]:
     metric_card("综合评分", f"{metrics['score']}", f"<span class='{grade_class(metrics['grade'])}'>{metrics['grade']}级 · {metrics['quality']}</span>")
 with cols[1]:
@@ -452,12 +592,16 @@ with cols[4]:
     metric_card("平均卫星数", fmt(metrics["avg_satellites"], 1), "颗")
 with cols[5]:
     metric_card("观测时长", fmt(metrics["duration_min"], 1), "分钟")
+if n_kpi >= 7:
+    gdop_mean = np.nanmean([g for g in pos_result["GDOP"] if np.isfinite(g)]) if pos_result["GDOP"] else float("nan")
+    with cols[6]:
+        metric_card("平均GDOP", fmt(gdop_mean, 1), "定位精度")
 
 # -----------------------------------------------------------------------------
 # 主标签页
 # -----------------------------------------------------------------------------
-tab_overview, tab_snr, tab_slip, tab_mp, tab_vis, tab_coord, tab_report = st.tabs(
-    ["总览", "SNR分析", "周跳探测", "多路径", "卫星可见性", "坐标转换", "报告导出"]
+tab_overview, tab_snr, tab_slip, tab_mp, tab_vis, tab_pos, tab_orbit, tab_coord, tab_report = st.tabs(
+    ["总览", "SNR分析", "周跳探测", "多路径", "卫星可见性", "定位解算", "卫星轨道", "坐标转换", "报告导出"]
 )
 
 with tab_overview:
@@ -497,7 +641,7 @@ with tab_overview:
         panel_end()
 
     with right:
-        panel_start("质量雷达图", "用于直观展示信号、连续性、多路径和可见卫星数量。")
+        panel_start("质量雷达图", "用于直观展示信号、连续性、多路径、卫星数量、定位精度等维度。")
         snr_score = 100 if not np.isfinite(metrics["avg_snr"]) else np.clip((metrics["avg_snr"] - 25) / 20 * 100, 0, 100)
         slip_score = np.clip(100 - metrics["cycle_slips"] * 5, 0, 100)
         mp_score = 60 if not np.isfinite(metrics["mp1_rms"]) else np.clip(100 - metrics["mp1_rms"] * 120, 0, 100)
@@ -505,6 +649,18 @@ with tab_overview:
         dur_score = 50 if not np.isfinite(metrics["duration_min"]) else np.clip(metrics["duration_min"] / 120 * 100, 0, 100)
         categories = ["SNR", "连续性", "多路径", "卫星数量", "观测时长"]
         values = [snr_score, slip_score, mp_score, sat_score, dur_score]
+
+        # 若有定位结果，加入 DOP 维度
+        has_pos = pos_result is not None and pos_result.get("n_epochs", 0) > 0
+        if has_pos:
+            avg_gdop_val = np.nanmean([g for g in pos_result["GDOP"] if np.isfinite(g)]) if pos_result["GDOP"] else float("nan")
+            if np.isfinite(avg_gdop_val):
+                dop_score = np.clip(100 - (avg_gdop_val - 1) * 15, 0, 100)
+            else:
+                dop_score = 50
+            categories = categories + ["定位精度"]
+            values = values + [dop_score]
+
         fig = go.Figure()
         fig.add_trace(go.Scatterpolar(
             r=values + [values[0]],
@@ -530,7 +686,7 @@ with tab_overview:
         panel_end()
 
         panel_start("核心指标表")
-        core = pd.DataFrame({
+        core_data = {
             "指标": ["观测时长/min", "平均SNR/dB-Hz", "周跳数", "MP1 RMS/m", "MP2 RMS/m", "平均卫星数"],
             "数值": [
                 fmt(metrics["duration_min"], 1),
@@ -540,9 +696,42 @@ with tab_overview:
                 fmt(metrics["mp2_rms"], 3),
                 fmt(metrics["avg_satellites"], 1),
             ],
-        })
+        }
+        if has_pos and np.isfinite(metrics.get("avg_gdop", float("nan"))):
+            core_data["指标"].append("平均GDOP")
+            core_data["数值"].append(fmt(metrics["avg_gdop"], 1))
+        core = pd.DataFrame(core_data)
         st.dataframe(core, use_container_width=True, hide_index=True)
         panel_end()
+
+        if pos_result is not None and pos_result.get("n_epochs", 0) > 0:
+            panel_start("定位解算结果", "伪距单点定位 (SPP) 概要")
+            cl, cr = st.columns(2)
+            with cl:
+                stat_df = pd.DataFrame({
+                    "项目": ["平均B", "平均L", "平均H", "解算历元", "平均卫星数", "定位模式"],
+                    "内容": [
+                        fmt(pos_result.get("mean_lat"), 8) + "°",
+                        fmt(pos_result.get("mean_lon"), 8) + "°",
+                        fmt(pos_result.get("mean_h"), 3) + " m",
+                        pos_result.get("n_epochs", 0),
+                        fmt(pos_result.get("mean_nsat", 0), 1) + " 颗",
+                        "伪距SPP",
+                    ],
+                })
+                st.dataframe(stat_df, use_container_width=True, hide_index=True)
+            with cr:
+                gdop_mean = np.nanmean([g for g in pos_result["GDOP"] if np.isfinite(g)]) if pos_result["GDOP"] else float("nan")
+                pdop_mean = np.nanmean([p for p in pos_result["PDOP"] if np.isfinite(p)]) if pos_result["PDOP"] else float("nan")
+                vdop_mean = np.nanmean([v for v in pos_result["VDOP"] if np.isfinite(v)]) if pos_result["VDOP"] else float("nan")
+                dop_df = pd.DataFrame({
+                    "指标": ["GDOP", "PDOP", "HDOP", "VDOP"],
+                    "均值": [fmt(gdop_mean, 2), fmt(pdop_mean, 2),
+                             fmt(np.nanmean([h for h in pos_result["HDOP"] if np.isfinite(h)]) if pos_result["HDOP"] else float("nan"), 2),
+                             fmt(vdop_mean, 2)],
+                })
+                st.dataframe(dop_df, use_container_width=True, hide_index=True)
+            panel_end()
 
 with tab_snr:
     sat_choice = st.selectbox("选择卫星", ["全部"] + sats, index=0, key="snr_sat")
@@ -656,6 +845,224 @@ with tab_vis:
         st.plotly_chart(fig, use_container_width=True)
         st.dataframe(vis_df, use_container_width=True, hide_index=True)
 
+with tab_pos:
+    if nav is None:
+        st.warning("请在左侧上传 RINEX NAV 导航文件以进行定位解算。")
+    elif pos_result is None or not pos_result.get("epochs"):
+        st.warning("定位解算失败或无有效历元数据。请确认：\n1) OBS 文件含伪距观测值\n2) NAV 文件卫星与 OBS 匹配\n3) 每历元至少有 4 颗可用卫星")
+    else:
+        st.markdown('<div class="glass-panel">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">定位结果概览</div>', unsafe_allow_html=True)
+
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        with c1:
+            metric_card("有效历元", f"{pos_result.get('n_epochs', 0)}", "")
+        with c2:
+            metric_card("平均卫星数", fmt(pos_result.get("mean_nsat", 0), 1), "颗")
+        with c3:
+            gdop_mean = np.nanmean([g for g in pos_result["GDOP"] if np.isfinite(g)]) if pos_result["GDOP"] else float("nan")
+            metric_card("平均GDOP", fmt(gdop_mean, 1), "")
+        with c4:
+            pdop_mean = np.nanmean([p for p in pos_result["PDOP"] if np.isfinite(p)]) if pos_result["PDOP"] else float("nan")
+            metric_card("平均PDOP", fmt(pdop_mean, 1), "")
+        with c5:
+            metric_card("残差RMS", fmt(pos_result.get("rms_residual", [float("nan")])[-1] if pos_result.get("rms_residual") else float("nan"), 3), "m")
+        with c6:
+            metric_card("解算模式", "伪距SPP", pos_system)
+
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown('<div class="glass-panel">', unsafe_allow_html=True)
+            st.markdown('<div class="section-title">平均坐标</div>', unsafe_allow_html=True)
+            stat_df = pd.DataFrame({
+                "分量": ["B (°)", "L (°)", "H (m)", "X (m)", "Y (m)", "Z (m)"],
+                "均值": [
+                    fmt(pos_result.get("mean_lat"), 8),
+                    fmt(pos_result.get("mean_lon"), 8),
+                    fmt(pos_result.get("mean_h"), 3),
+                    fmt(pos_result.get("mean_X"), 3),
+                    fmt(pos_result.get("mean_Y"), 3),
+                    fmt(pos_result.get("mean_Z"), 3),
+                ],
+                "标准差(1σ)": [
+                    fmt(pos_result.get("std_lat"), 6),
+                    fmt(pos_result.get("std_lon"), 6),
+                    fmt(pos_result.get("std_h"), 3),
+                    fmt(pos_result.get("std_X"), 3),
+                    fmt(pos_result.get("std_Y"), 3),
+                    fmt(pos_result.get("std_Z"), 3),
+                ],
+            })
+            st.dataframe(stat_df, use_container_width=True, hide_index=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        with c2:
+            st.markdown('<div class="glass-panel">', unsafe_allow_html=True)
+            st.markdown('<div class="section-title">DOP 值统计</div>', unsafe_allow_html=True)
+            dop_df = pd.DataFrame({
+                "指标": ["GDOP", "PDOP", "HDOP", "VDOP", "TDOP"],
+                "均值": [
+                    fmt(np.nanmean([g for g in pos_result["GDOP"] if np.isfinite(g)]) if pos_result["GDOP"] else float("nan"), 2),
+                    fmt(np.nanmean([p for p in pos_result["PDOP"] if np.isfinite(p)]) if pos_result["PDOP"] else float("nan"), 2),
+                    fmt(np.nanmean([h for h in pos_result["HDOP"] if np.isfinite(h)]) if pos_result["HDOP"] else float("nan"), 2),
+                    fmt(np.nanmean([v for v in pos_result["VDOP"] if np.isfinite(v)]) if pos_result["VDOP"] else float("nan"), 2),
+                    fmt(np.nanmean([t for t in pos_result["TDOP"] if np.isfinite(t)]) if pos_result["TDOP"] else float("nan"), 2),
+                ],
+            })
+            st.dataframe(dop_df, use_container_width=True, hide_index=True)
+            st.caption("参考：GDOP < 2 优秀，2~4 良好，4~6 一般，> 6 较差；定位解算需要 GDOP 尽量小。")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        # 坐标时间序列图
+        st.markdown('<div class="glass-panel">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">坐标与 DOP 时间序列</div>', unsafe_allow_html=True)
+        fig_pos = go.Figure()
+        if pos_result["X"]:
+            x_arr = np.array(pos_result["X"])
+            y_arr = np.array(pos_result["Y"])
+            z_arr = np.array(pos_result["Z"])
+            epochs_pos = pos_result["epochs"]
+            fig_pos.add_trace(go.Scatter(x=epochs_pos, y=x_arr - np.nanmean(x_arr),
+                                         mode="lines+markers", name="ΔX", marker=dict(size=3)))
+            fig_pos.add_trace(go.Scatter(x=epochs_pos, y=y_arr - np.nanmean(y_arr),
+                                         mode="lines+markers", name="ΔY", marker=dict(size=3)))
+            fig_pos.add_trace(go.Scatter(x=epochs_pos, y=z_arr - np.nanmean(z_arr),
+                                         mode="lines+markers", name="ΔZ", marker=dict(size=3)))
+        make_plot_layout(fig_pos, "坐标变化 (去均值)")
+        fig_pos.update_yaxes(title="Δ / m")
+        st.plotly_chart(fig_pos, use_container_width=True)
+
+        fig_dop = go.Figure()
+        if pos_result["GDOP"]:
+            fig_dop.add_trace(go.Scatter(x=pos_result["epochs"], y=pos_result["GDOP"],
+                                         mode="lines", name="GDOP"))
+            fig_dop.add_trace(go.Scatter(x=pos_result["epochs"], y=pos_result["PDOP"],
+                                         mode="lines", name="PDOP"))
+            fig_dop.add_trace(go.Scatter(x=pos_result["epochs"], y=pos_result["HDOP"],
+                                         mode="lines", name="HDOP"))
+            fig_dop.add_trace(go.Scatter(x=pos_result["epochs"], y=pos_result["VDOP"],
+                                         mode="lines", name="VDOP"))
+        make_plot_layout(fig_dop, "DOP 值时间序列")
+        fig_dop.update_yaxes(title="DOP")
+        st.plotly_chart(fig_dop, use_container_width=True)
+
+        # 卫星数
+        fig_nsat = go.Figure()
+        fig_nsat.add_trace(go.Scatter(x=pos_result["epochs"], y=pos_result["nsat"],
+                                      mode="lines", name="可用卫星数",
+                                      fill="tozeroy", line=dict(color="#38bdf8")))
+        make_plot_layout(fig_nsat, "每历元可用卫星数")
+        fig_nsat.update_yaxes(title="卫星数 / 颗", rangemode="tozero")
+        st.plotly_chart(fig_nsat, use_container_width=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # 坐标数据表
+        st.markdown('<div class="glass-panel">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">逐历元定位结果</div>', unsafe_allow_html=True)
+        pdf = pos_dataframe(pos_result)
+        if not pdf.empty:
+            st.dataframe(pdf, use_container_width=True, hide_index=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
+with tab_orbit:
+    if nav is None:
+        st.warning("请在左侧上传 RINEX NAV 导航文件。")
+    else:
+        st.markdown('<div class="glass-panel">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">导航星历概览</div>', unsafe_allow_html=True)
+        nav_prns = nav.get_all_prns()
+        total_eph = sum(len(nav._eph.get(p, [])) for p in nav_prns)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("星历卫星数", len(nav_prns))
+        c2.metric("星历总数", total_eph)
+        c3.metric("卫星系统", "GPS" if nav.system == "G" else ("BDS" if nav.system == "C" else nav.system))
+
+        if nav.iono_params:
+            st.caption(f"电离层参数 (Klobuchar): α={nav.iono_params.get('alpha', [])}, β={nav.iono_params.get('beta', [])}")
+        else:
+            st.caption("未包含电离层改正参数")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # 选择历元和卫星做天空图
+        st.markdown('<div class="glass-panel">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">卫星天空图</div>', unsafe_allow_html=True)
+        if not data or not sats:
+            st.warning("需要先加载 OBS 数据。")
+        elif pos_result is not None and pos_result.get("epochs"):
+            epoch_choice = st.selectbox("选择历元", pos_result["epochs"], key="orbit_epoch",
+                                        format_func=lambda x: x.strftime("%Y-%m-%d %H:%M:%S"))
+            eph_dict = get_nav_eph_dict(nav)
+            azel_list = []
+            for prn in sats:
+                eph = None
+                for e in eph_dict.get(prn, []):
+                    toe = e.get('toe', 0.0)
+                    if toe > 0:
+                        eph = e
+                        break
+                if eph is None:
+                    continue
+                sat_pos = calc_sat_position(prn, eph, epoch_choice, 'C' if prn.startswith('C') else 'G')
+                if sat_pos is None:
+                    continue
+                # 使用 SPP 坐标或近似坐标
+                rec_x = pos_result.get("mean_X", 0)
+                rec_y = pos_result.get("mean_Y", 0)
+                rec_z = pos_result.get("mean_Z", 0)
+                if not np.isfinite(rec_x):
+                    rec_x, rec_y, rec_z = 0, 0, 0
+                elev, az, _ = calc_sat_azel((sat_pos["X"], sat_pos["Y"], sat_pos["Z"]), (rec_x, rec_y, rec_z))
+                if elev >= 0:
+                    azel_list.append((elev, az, prn))
+            if azel_list:
+                sky = make_skyplot(azel_list, f"天空图 {epoch_choice.strftime('%Y-%m-%d %H:%M:%S')}")
+                st.plotly_chart(sky, use_container_width=True)
+            else:
+                st.warning("该历元无有效卫星。")
+        else:
+            st.warning("需先完成定位解算才能展示天空图。")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # 卫星星历详情
+        st.markdown('<div class="glass-panel">', unsafe_allow_html=True)
+        st.markdown('<div class="section-title">广播星历参数详情</div>', unsafe_allow_html=True)
+        nav_sel_prn = st.selectbox("选择卫星查看星历", nav_prns, key="nav_prn_detail")
+        if nav_sel_prn:
+            ephs = nav._eph.get(nav_sel_prn, [])
+            if ephs:
+                eph = ephs[0]
+                eph_rows = [
+                    ["卫星", nav_sel_prn],
+                    ["GPS周", eph.get("gps_week", "")],
+                    ["Toe (周内秒)", fmt(eph.get("toe", 0), 0)],
+                    ["√A (m^0.5)", fmt(eph.get("sqrt_a", 0), 3)],
+                    ["e (偏心率)", fmt(eph.get("e", 0), 8)],
+                    ["i0 (°)", fmt(eph.get("i0", 0), 6)],
+                    ["Ω0 (°)", fmt(eph.get("omega0", 0), 6)],
+                    ["ω (°)", fmt(eph.get("omega", 0), 6)],
+                    ["M0 (°)", fmt(eph.get("m0", 0), 6)],
+                    ["Δn (rad/s)", fmt(eph.get("delta_n", 0), 9)],
+                    ["Ω̇ (rad/s)", fmt(eph.get("omega_dot", 0), 9)],
+                    ["IDOT (rad/s)", fmt(eph.get("idot", 0), 9)],
+                    ["Cuc (rad)", fmt(eph.get("cuc", 0), 8)],
+                    ["Cus (rad)", fmt(eph.get("cus", 0), 8)],
+                    ["Crc (m)", fmt(eph.get("crc", 0), 3)],
+                    ["Crs (m)", fmt(eph.get("crs", 0), 3)],
+                    ["Cic (rad)", fmt(eph.get("cic", 0), 8)],
+                    ["Cis (rad)", fmt(eph.get("cis", 0), 8)],
+                    ["TGD (s)", fmt(eph.get("tgd", 0), 9)],
+                    ["钟偏 (s)", fmt(eph.get("sv_clock_bias", 0), 9)],
+                    ["钟漂 (s/s)", fmt(eph.get("sv_clock_drift", 0), 9)],
+                ]
+                st.dataframe(pd.DataFrame(eph_rows, columns=["参数", "值"]), use_container_width=True, hide_index=True)
+                st.caption("仅显示该卫星第一组星历，用于参考。")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
 with tab_coord:
     st.markdown('<div class="glass-panel">', unsafe_allow_html=True)
     st.markdown('<div class="section-title">坐标转换</div>', unsafe_allow_html=True)
@@ -722,8 +1129,8 @@ with tab_coord:
     st.markdown('</div>', unsafe_allow_html=True)
 
 with tab_report:
-    report_text = quality_evaluation_report(data, obs_types)
-    full_report = quality_summary(data, obs_types)
+    report_text = quality_evaluation_report(data, obs_types, pos_result)
+    full_report = quality_summary(data, obs_types, pos_result)
 
     c1, c2 = st.columns([1, 1])
     with c1:

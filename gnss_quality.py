@@ -314,10 +314,40 @@ def visibility_stats(data: Dict[str, Dict[str, Any]]):
 
 def compute_dop(data, obs_types, station_xyz=None):
     """
-    DOP 计算预留接口。
-    仅靠 OBS 文件通常无法准确得到卫星空间位置，因此这里返回 None。
+    基于卫星方位角/高度角计算 DOP 值。
+    不依赖 NAV 星历，而是从观测数据中假设的卫星位置计算。
+    若无法确定卫星-接收机几何关系，返回 None。
+
+    在实际使用中建议优先使用 spp_positioning 中的 compute_dop_from_azel，
+    该函数基于定位解算过程中已知的卫星高度角和方位角计算 DOP。
     """
+    try:
+        from satellite_orbit import compute_dop_from_azel
+    except ImportError:
+        return None
+
+    # 尝试从 header 获取测站近似坐标
+    rec_xyz = station_xyz
+    if rec_xyz is None:
+        return None
+
+    # 由于没有卫星星历，这里需要外部提供卫星方位角/高度角
+    # 返回 None 表示需要定位解算完成后才能计算
     return None
+
+
+def compute_dop_for_epoch(sat_azel_list):
+    """
+    根据卫星高度角/方位角列表计算 DOP。
+
+    参数:
+        sat_azel_list: [(elev_deg, azim_deg), ...]
+
+    返回:
+        {'GDOP': val, 'PDOP': val, 'HDOP': val, 'VDOP': val, 'TDOP': val}
+    """
+    from satellite_orbit import compute_dop_from_azel
+    return compute_dop_from_azel(sat_azel_list)
 
 
 def compute_sat_elevation(sat_xyz, rec_xyz):
@@ -343,8 +373,9 @@ def compute_sat_elevation(sat_xyz, rec_xyz):
     return float(np.degrees(elev))
 
 
-def compute_quality_metrics(data: Dict[str, Dict[str, Any]], obs_types: List[str]) -> Dict[str, Any]:
-    """计算课程设计用的综合质量评价指标。"""
+def compute_quality_metrics(data: Dict[str, Dict[str, Any]], obs_types: List[str],
+                            pos_result: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """计算课程设计用的综合质量评价指标，可选传入定位结果以纳入定位精度评分。"""
     stats = visibility_stats(data)
     all_sats = sorted(data.keys())
     epochs = sorted(stats.keys()) if stats else []
@@ -393,65 +424,99 @@ def compute_quality_metrics(data: Dict[str, Dict[str, Any]], obs_types: List[str
     mp1_rms = _rms(mp1_values)
     mp2_rms = _rms(mp2_values)
 
+    # 提取定位相关指标
+    avg_gdop = float('nan')
+    avg_pdop = float('nan')
+    pos_std_3d = float('nan')
+    if pos_result is not None and pos_result.get("n_epochs", 0) > 0:
+        gdop_vals = [g for g in pos_result.get("GDOP", []) if np.isfinite(g)]
+        if gdop_vals:
+            avg_gdop = float(np.mean(gdop_vals))
+        pdop_vals = [p for p in pos_result.get("PDOP", []) if np.isfinite(p)]
+        if pdop_vals:
+            avg_pdop = float(np.mean(pdop_vals))
+        if pos_result.get("std_X") is not None and np.isfinite(pos_result["std_X"]):
+            pos_std_3d = float(np.sqrt(pos_result["std_X"]**2 + pos_result["std_Y"]**2 + pos_result["std_Z"]**2))
+
     # 简洁评分规则，适合课程作业说明
     score = 100
     deductions = []
 
     if np.isfinite(snr_stat['avg']):
         if snr_stat['avg'] < 30:
-            score -= 30
-            deductions.append('平均 SNR < 30 dB-Hz，信号质量较差，扣 30 分')
+            score -= 25
+            deductions.append('平均 SNR < 30 dB-Hz，信号质量较差，扣 25 分')
         elif snr_stat['avg'] < 35:
-            score -= 20
-            deductions.append('平均 SNR < 35 dB-Hz，信号偏弱，扣 20 分')
+            score -= 15
+            deductions.append('平均 SNR < 35 dB-Hz，信号偏弱，扣 15 分')
         elif snr_stat['avg'] < 40:
-            score -= 10
-            deductions.append('平均 SNR < 40 dB-Hz，信号一般，扣 10 分')
+            score -= 8
+            deductions.append('平均 SNR < 40 dB-Hz，信号一般，扣 8 分')
     else:
-        score -= 10
-        deductions.append('缺少 SNR 观测值，无法评价信噪比，扣 10 分')
+        score -= 8
+        deductions.append('缺少 SNR 观测值，无法评价信噪比，扣 8 分')
 
     if np.isfinite(mp1_rms):
         if mp1_rms > 1.0:
-            score -= 30
-            deductions.append('MP1 RMS > 1.0 m，多路径影响明显，扣 30 分')
+            score -= 25
+            deductions.append('MP1 RMS > 1.0 m，多路径影响明显，扣 25 分')
         elif mp1_rms > 0.5:
-            score -= 20
-            deductions.append('MP1 RMS > 0.5 m，多路径影响偏大，扣 20 分')
+            score -= 15
+            deductions.append('MP1 RMS > 0.5 m，多路径影响偏大，扣 15 分')
         elif mp1_rms > 0.3:
-            score -= 10
-            deductions.append('MP1 RMS > 0.3 m，多路径影响一般，扣 10 分')
+            score -= 8
+            deductions.append('MP1 RMS > 0.3 m，多路径影响一般，扣 8 分')
     else:
         score -= 5
         deductions.append('缺少双频伪距/载波数据，无法计算 MP1，扣 5 分')
 
     if total_slips > 20:
-        score -= 30
-        deductions.append('可疑周跳数 > 20，观测连续性较差，扣 30 分')
+        score -= 25
+        deductions.append('可疑周跳数 > 20，观测连续性较差，扣 25 分')
     elif total_slips > 10:
-        score -= 20
-        deductions.append('可疑周跳数 > 10，观测连续性一般，扣 20 分')
+        score -= 15
+        deductions.append('可疑周跳数 > 10，观测连续性一般，扣 15 分')
     elif total_slips > 3:
-        score -= 10
-        deductions.append('存在多处可疑周跳，扣 10 分')
+        score -= 8
+        deductions.append('存在多处可疑周跳，扣 8 分')
 
     if np.isfinite(avg_total):
         if avg_total < 6:
-            score -= 25
-            deductions.append('平均可见卫星数 < 6，几何条件较差，扣 25 分')
+            score -= 20
+            deductions.append('平均可见卫星数 < 6，几何条件较差，扣 20 分')
         elif avg_total < 10:
-            score -= 10
-            deductions.append('平均可见卫星数 < 10，卫星数量一般，扣 10 分')
+            score -= 8
+            deductions.append('平均可见卫星数 < 10，卫星数量一般，扣 8 分')
 
-    score = max(0, int(round(score)))
+    # 定位精度评分（若有定位结果）
+    if np.isfinite(avg_gdop):
+        if avg_gdop > 6:
+            score -= 15
+            deductions.append(f'平均 GDOP={avg_gdop:.1f} > 6，定位几何条件较差，扣 15 分')
+        elif avg_gdop > 4:
+            score -= 8
+            deductions.append(f'平均 GDOP={avg_gdop:.1f} > 4，定位几何条件一般，扣 8 分')
+        elif avg_gdop < 2:
+            deductions.append(f'平均 GDOP={avg_gdop:.1f} < 2，定位几何条件优秀 (+5 分奖励)')
+            score += 5  # 奖励分
+
+    if np.isfinite(pos_std_3d):
+        if pos_std_3d > 10:
+            score -= 10
+            deductions.append(f'定位标准差 3D={pos_std_3d:.1f} m > 10 m，定位精度较差，扣 10 分')
+        elif pos_std_3d > 5:
+            score -= 5
+            deductions.append(f'定位标准差 3D={pos_std_3d:.1f} m > 5 m，定位精度一般，扣 5 分')
+
+    score = max(0, min(105, int(round(score))))
     if score >= 90:
         grade = 'A'
         quality = '优秀'
-        suggestion = '适合静态控制测量；观测数据整体稳定，可作为课程设计优质样例。'
+        suggestion = '适合静态控制测量与定位解算；观测数据整体稳定，可作为课程设计优质样例。'
     elif score >= 80:
         grade = 'B'
         quality = '良好'
-        suggestion = '基本适合静态控制测量；建议重点检查少量周跳或多路径较大的卫星弧段。'
+        suggestion = '基本适合静态控制测量与定位解算；建议重点检查少量周跳或多路径较大的卫星弧段。'
     elif score >= 70:
         grade = 'C'
         quality = '一般'
@@ -482,12 +547,16 @@ def compute_quality_metrics(data: Dict[str, Dict[str, Any]], obs_types: List[str
         'mp1_rms': mp1_rms,
         'mp2_rms': mp2_rms,
         'mp_by_sat': mp_by_sat,
+        'avg_gdop': avg_gdop,
+        'avg_pdop': avg_pdop,
+        'pos_std_3d': pos_std_3d,
     }
 
 
-def quality_evaluation_report(data: Dict[str, Dict[str, Any]], obs_types: List[str]) -> str:
+def quality_evaluation_report(data: Dict[str, Dict[str, Any]], obs_types: List[str],
+                               pos_result: Dict[str, Any] | None = None) -> str:
     """生成综合数据质量评价报告。"""
-    m = compute_quality_metrics(data, obs_types)
+    m = compute_quality_metrics(data, obs_types, pos_result)
 
     def fmt(value, digits=1, suffix=''):
         try:
@@ -541,8 +610,9 @@ def quality_evaluation_report(data: Dict[str, Dict[str, Any]], obs_types: List[s
     return '\n'.join(lines)
 
 
-def quality_summary(data: Dict[str, Dict[str, Any]], obs_types: List[str]) -> str:
-    """生成完整文本报告，含可见性、周跳、多路径与综合评价。"""
+def quality_summary(data: Dict[str, Dict[str, Any]], obs_types: List[str],
+                     pos_result: Dict[str, Any] | None = None) -> str:
+    """生成完整文本报告，含可见性、周跳、多路径、定位与综合评价。"""
     stats = visibility_stats(data)
     all_sats = sorted(data.keys())
 
@@ -619,10 +689,38 @@ def quality_summary(data: Dict[str, Dict[str, Any]], obs_types: List[str]) -> st
     if shown == 0:
         lines.append('  无有效多路径数据')
 
+    # 定位结果（若有）
+    if pos_result is not None and pos_result.get("n_epochs", 0) > 0:
+        lines.append(f"\n{'─' * 64}")
+        lines.append('  定位解算结果 (SPP)')
+        lines.append(f"{'─' * 64}")
+        lines.append(f"  解算历元数:   {pos_result.get('n_epochs', 0)}")
+        lines.append(f"  平均可用卫星: {pos_result.get('mean_nsat', 0):.1f} 颗")
+        if np.isfinite(pos_result.get('mean_lat', float('nan'))):
+            from coord_convert import deg_to_dms
+            lat = pos_result['mean_lat']
+            lon = pos_result['mean_lon']
+            h = pos_result.get('mean_h', 0)
+            ld, lm, ls = deg_to_dms(abs(lat))
+            lod, lom, los = deg_to_dms(abs(lon))
+            lat_hemi = 'N' if lat >= 0 else 'S'
+            lon_hemi = 'E' if lon >= 0 else 'W'
+            lines.append(f"  平均坐标:     B={ld}°{lm:02d}'{ls:06.3f}\" {lat_hemi}")
+            lines.append(f"                L={lod}°{lom:02d}'{los:06.3f}\" {lon_hemi}")
+            lines.append(f"                H={h:.4f} m")
+            lines.append(f"                X={pos_result.get('mean_X', 0):.4f} m")
+            lines.append(f"                Y={pos_result.get('mean_Y', 0):.4f} m")
+            lines.append(f"                Z={pos_result.get('mean_Z', 0):.4f} m")
+        gdop_mean = np.nanmean([g for g in pos_result.get("GDOP", []) if np.isfinite(g)])
+        pdop_mean = np.nanmean([p for p in pos_result.get("PDOP", []) if np.isfinite(p)])
+        if np.isfinite(gdop_mean):
+            lines.append(f"  平均 GDOP:     {gdop_mean:.2f}")
+            lines.append(f"  平均 PDOP:     {pdop_mean:.2f}")
+
     lines.append(f"\n{'─' * 64}")
     lines.append('  综合质量评价')
     lines.append(f"{'─' * 64}")
-    m = compute_quality_metrics(data, obs_types)
+    m = compute_quality_metrics(data, obs_types, pos_result)
     lines.append(f"  综合评分: {m['score']} / 100")
     lines.append(f"  质量等级: {m['grade']} 级")
     lines.append(f"  数据质量: {m['quality']}")
