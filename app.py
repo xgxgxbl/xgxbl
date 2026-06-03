@@ -16,6 +16,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from rinex_reader import RinexObs
+from gns_reader import GnsFile
 from gnss_quality import cycle_slip_detect, station_slip_summary
 from sync_loop import SyncLoopChecker, generate_example_baseline
 
@@ -262,10 +263,12 @@ st.markdown(
 with st.sidebar:
     st.markdown("### 📡 数据输入")
 
-    st.caption("上传多个 RINEX OBS 观测文件")
+    st.caption("上传多个 RINEX OBS / GNS 观测文件")
     uploaded_files = st.file_uploader(
-        "选择 RINEX OBS 文件",
-        type=["obs", "OBS", "23o", "24o", "25o", "26o", "o", "O"],
+        "选择观测文件",
+        type=["obs","OBS","23o","24o","25o","26o","o","O",
+              "gns","GNS",
+              "rnx","RNX","crx","CRX"],
         accept_multiple_files=True,
         key="uploaded_rinex",
     )
@@ -302,14 +305,35 @@ with st.sidebar:
 # =============================================================================
 # 数据加载
 # =============================================================================
-rinex_list: list[tuple[str, RinexObs]] = []
+rinex_list: list[tuple[str, object]] = []   # (测站名, RinexObs | GnsFile)
+gns_only_stations: list[str] = []            # 仅有GNS、无法周跳探测的测站
+
 if uploaded_files:
-    with st.spinner("正在解析 RINEX 文件……"):
+    with st.spinner("正在解析观测文件……"):
         for uf in uploaded_files:
             try:
-                robj = parse_rinex_cached(uf.getvalue(), uf.name)
-                stn = robj.header.get("marker_name", uf.name.rsplit(".", 1)[0])
-                rinex_list.append((stn, robj))
+                raw_bytes = uf.getvalue()
+                # 智能格式检测：检查文件头
+                is_gns = (raw_bytes[:30].find(b"ZHD COLLECTED") >= 0 or
+                          raw_bytes[:30].find(b"HITRTK") >= 0 or
+                          uf.name.lower().endswith(".gns"))
+
+                if is_gns:
+                    # GNS 文件：保存临时文件后用 GnsFile 解析
+                    suffix = os.path.splitext(uf.name)[1] or ".GNS"
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                        tmp.write(raw_bytes)
+                        tmp_path = tmp.name
+                    gobj = GnsFile(tmp_path)
+                    stn = gobj.station_name
+                    rinex_list.append((stn, gobj))
+                    if not gobj.has_obs_data:
+                        gns_only_stations.append(stn)
+                else:
+                    # RINEX 文件
+                    robj = parse_rinex_cached(raw_bytes, uf.name)
+                    stn = robj.header.get("marker_name", uf.name.rsplit(".", 1)[0])
+                    rinex_list.append((stn, robj))
             except Exception as exc:
                 st.error(f"解析 {uf.name} 失败：{exc}")
 
@@ -364,36 +388,60 @@ with tab_stats:
     for stn, robj in rinex_list:
         comp = robj.get_system_composition()
         interval = robj.get_sampling_interval()
-        times = robj.get_times()
-        sats = robj.get_satellites()
+        is_gns = isinstance(robj, GnsFile)
 
-        start_str = times[0].strftime("%Y-%m-%d %H:%M:%S") if times else "?"
-        end_str = times[-1].strftime("%Y-%m-%d %H:%M:%S") if times else "?"
-        dur_min = (times[-1] - times[0]).total_seconds() / 60.0 if len(times) >= 2 else 0
+        if is_gns:
+            sats = robj.get_satellites()
+            rows.append({
+                "测站名": stn,
+                "文件名": os.path.basename(robj.filepath),
+                "格式": "GNS",
+                "历元数": robj.n_epochs,
+                "卫星数": len(sats),
+                "GPS": comp.get('G', 0),
+                "BDS": comp.get('C', 0),
+                "GAL": comp.get('E', 0),
+                "GLO": comp.get('R', 0),
+                "采样间隔": "?" if interval is None else f"{interval:.0f}s",
+                "观测时长": "?",
+                "起始时间": robj.header.get("date", "?"),
+                "结束时间": robj.header.get("date", "?"),
+            })
+        else:
+            times = robj.get_times()
+            sats = robj.get_satellites()
+            start_str = times[0].strftime("%Y-%m-%d %H:%M:%S") if times else "?"
+            end_str = times[-1].strftime("%Y-%m-%d %H:%M:%S") if times else "?"
+            dur_min = (times[-1] - times[0]).total_seconds() / 60.0 if len(times) >= 2 else 0
 
-        rows.append({
-            "测站名": stn,
-            "文件名": os.path.basename(robj.filepath),
-            "历元数": len(times),
-            "卫星数": len(sats),
-            "GPS": comp.get('G', 0),
-            "BDS": comp.get('C', 0),
-            "GAL": comp.get('E', 0),
-            "GLO": comp.get('R', 0),
-            "采样间隔": f"{interval:.0f}s" if interval else "?",
-            "观测时长": f"{dur_min:.0f}min",
-            "起始时间": start_str,
-            "结束时间": end_str,
-        })
+            rows.append({
+                "测站名": stn,
+                "文件名": os.path.basename(robj.filepath),
+                "格式": "RINEX",
+                "历元数": len(times),
+                "卫星数": len(sats),
+                "GPS": comp.get('G', 0),
+                "BDS": comp.get('C', 0),
+                "GAL": comp.get('E', 0),
+                "GLO": comp.get('R', 0),
+                "采样间隔": f"{interval:.0f}s" if interval else "?",
+                "观测时长": f"{dur_min:.0f}min",
+                "起始时间": start_str,
+                "结束时间": end_str,
+            })
 
     df_stats = pd.DataFrame(rows)
     st.dataframe(df_stats, use_container_width=True, hide_index=True)
 
     # KPI 卡片行
     total_stations = len(rinex_list)
-    total_epochs_sum = sum(len(robj.get_times()) for _, robj in rinex_list)
+    total_epochs_sum = 0
     all_sats_union = set()
     for _, robj in rinex_list:
+        if isinstance(robj, GnsFile):
+            total_epochs_sum += robj.n_epochs
+        else:
+            total_epochs_sum += len(robj.get_times())
         all_sats_union.update(robj.get_satellites())
 
     c1, c2, c3, c4 = st.columns(4)
@@ -410,7 +458,10 @@ with tab_stats:
         fig_bar = go.Figure()
         sys_types = ['G', 'C', 'E', 'R']
         for s in sys_types:
-            vals = [robj.get_system_composition().get(s, 0) for _, robj in rinex_list]
+            vals = []
+            for _, robj in rinex_list:
+                comp = robj.get_system_composition()
+                vals.append(comp.get(s, 0))
             if any(v > 0 for v in vals):
                 fig_bar.add_trace(go.Bar(
                     name=system_label(s),
@@ -577,59 +628,71 @@ with tab_slip:
     # 测站选择
     station_choices = [stn for stn, _ in rinex_list]
     if len(station_choices) == 0:
-        st.warning("请先上传 RINEX 文件")
+        st.warning("请先上传观测文件")
     else:
         selected_stn = st.selectbox("选择测站", station_choices, key="slip_station")
 
-        # 找到对应的 RinexObs
-        stn_to_rinex = {stn: robj for stn, robj in rinex_list}
-        robj = stn_to_rinex[selected_stn]
-        data = robj.get_data()
-        obs_types = robj.obs_types
-        sats = robj.get_satellites()
+        # 找到对应的解析对象
+        stn_to_obj = {stn: robj for stn, robj in rinex_list}
+        robj = stn_to_obj[selected_stn]
 
-        if not sats:
-            st.warning("该文件没有卫星数据")
+        # GNS 文件不支持周跳探测
+        if isinstance(robj, GnsFile):
+            st.info(
+                f"📋 **{selected_stn}** 是 GNS 原始二进制格式，"
+                "暂不支持直接进行周跳探测。\n\n"
+                "请使用 **RTKLIB convbin** 工具将 GNS 转换为 RINEX OBS 格式后重新上传。\n\n"
+                "```bash\nconvbin -r gps -v 2.11 -od -os input.GNS\n```\n\n"
+                f"该文件基本信息：{robj.n_epochs} 个历元，{len(robj.satellites)} 颗卫星，"
+                f"观测日期 {robj.header.get('date', '?')}。"
+            )
         else:
-            # 测站周跳汇总
-            slip_summary = station_slip_summary(data, obs_types, selected_stn, mw_threshold, gf_threshold)
+            data = robj.get_data()
+            obs_types = robj.obs_types
+            sats = robj.get_satellites()
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("卫星数", slip_summary["sat_count"])
-            c2.metric("总周跳数", slip_summary["total_slips"])
-            c3.metric("存在周跳的卫星数", slip_summary["sat_with_slips"])
-            c4.metric("MW阈值", f"{mw_threshold:.1f} 周")
+            if not sats:
+                st.warning("该文件没有卫星数据")
+            else:
+                # 测站周跳汇总
+                slip_summary = station_slip_summary(data, obs_types, selected_stn, mw_threshold, gf_threshold)
 
-            # 与同步环的关联分析
-            if checker and slip_summary["total_slips"] > 0:
-                sloops = checker.station_loops(selected_stn)
-                if sloops:
-                    failed = [r for r in sloops if not r['pass']]
-                    if failed:
-                        failed_ids = [f"环 {r['loop'][0]}→{r['loop'][1]}→{r['loop'][2]}" for r in failed]
-                        st.markdown(
-                            f'<div class="alert-card">'
-                            f'⚠️ <b>{selected_stn}</b> 共检测到 <b>{slip_summary["total_slips"]}</b> 处可疑周跳，'
-                            f'且该测站参与了 <b>{len(failed)}</b> 个不合格同步环：<br>'
-                            f'{"<br>".join(failed_ids)}<br>'
-                            f'<small>周跳可能导致载波相位观测值不连续，建议检查对应基线处理结果。</small>'
-                            f'</div>',
-                            unsafe_allow_html=True,
-                        )
-                    else:
-                        st.markdown(
-                            f'<div class="info-card">'
-                            f'✅ {selected_stn} 虽有 {slip_summary["total_slips"]} 处周跳，但参与的所有同步环均合格。'
-                            f'</div>',
-                            unsafe_allow_html=True,
-                        )
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("卫星数", slip_summary["sat_count"])
+                c2.metric("总周跳数", slip_summary["total_slips"])
+                c3.metric("存在周跳的卫星数", slip_summary["sat_with_slips"])
+                c4.metric("MW阈值", f"{mw_threshold:.1f} 周")
 
-            # 选择卫星查看详细周跳曲线
-            sat_choice = st.selectbox("选择卫星", sats, key="slip_sat_detail")
+                # 与同步环的关联分析
+                if checker and slip_summary["total_slips"] > 0:
+                    sloops = checker.station_loops(selected_stn)
+                    if sloops:
+                        failed = [r for r in sloops if not r['pass']]
+                        if failed:
+                            failed_ids = [f"环 {r['loop'][0]}→{r['loop'][1]}→{r['loop'][2]}" for r in failed]
+                            st.markdown(
+                                f'<div class="alert-card">'
+                                f'⚠️ <b>{selected_stn}</b> 共检测到 <b>{slip_summary["total_slips"]}</b> 处可疑周跳，'
+                                f'且该测站参与了 <b>{len(failed)}</b> 个不合格同步环：<br>'
+                                f'{"<br>".join(failed_ids)}<br>'
+                                f'<small>周跳可能导致载波相位观测值不连续，建议检查对应基线处理结果。</small>'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            st.markdown(
+                                f'<div class="info-card">'
+                                f'✅ {selected_stn} 虽有 {slip_summary["total_slips"]} 处周跳，但参与的所有同步环均合格。'
+                                f'</div>',
+                                unsafe_allow_html=True,
+                            )
 
-            if sat_choice:
-                slips, mw_series, gf_series = cycle_slip_detect(data, obs_types, sat_choice, mw_threshold, gf_threshold)
-                epochs = data.get(sat_choice, {}).get("epoch", [])
+                # 选择卫星查看详细周跳曲线
+                sat_choice = st.selectbox("选择卫星", sats, key="slip_sat_detail")
+
+                if sat_choice:
+                    slips, mw_series, gf_series = cycle_slip_detect(data, obs_types, sat_choice, mw_threshold, gf_threshold)
+                    epochs = data.get(sat_choice, {}).get("epoch", [])
 
                 c1, c2, c3 = st.columns(3)
                 c1.metric(f"{sat_choice} 可疑周跳", len(slips))
